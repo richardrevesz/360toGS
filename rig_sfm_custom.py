@@ -74,14 +74,13 @@ def compute_rig_config(
     rig_cameras = []
     
     # Check which cameras actually exist in the folder (as subfolders)
-    # The usage assumes image structure: folder/CameraName/image.png
+    # The usage assumes image structure: colmap/rig/CameraName/frame#.png
     # But we need to match the blender name.
     
     sorted_cam_names = sorted(blender_cameras.keys())
     
     for cam_name in sorted_cam_names:
         # Construct prefix. 
-        # CAUTION: The user puts images in "Camera0", "Camera1" subfolders.
         # COLMAP ImageReader with PER_FOLDER mode will use the relative path 
         # from the root image_path. 
         # The root image_path passed to extract_features will likely be the parent containing table2_low etc.
@@ -175,7 +174,6 @@ def run(args):
     pycolmap.set_random_seed(0)
     
     # We assume standard feature extraction is sufficient.
-    # If the user has masks, we can add mask_path logic, but simpler to start without.
     pycolmap.extract_features(
         database_path, 
         input_path, 
@@ -202,9 +200,6 @@ def run(args):
     
     logging.info("Starting incremental mapping...")
     
-    # Check if we should fix existing poses?
-    # The user wanted COLMAP to reconstruct. 
-    # Rig bundle adjustment refines the relative poses if configured?
     # Default RigConfig assumes fixed relative poses but allows rig to move.
     
     maps = pycolmap.incremental_mapping(
