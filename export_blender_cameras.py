@@ -10,7 +10,7 @@ def export_cameras():
     """
     
     # Path to save the json. Defaults to the same folder as the blend file.
-    # If blend file is not saved, saves to C:/tmp or similar (user might need to adjust).
+    # If blend file is not saved, saves to C:/tmp or similar (might need to adjust).
     blend_path = bpy.data.filepath
     if blend_path:
         base_dir = os.path.dirname(blend_path)
@@ -39,8 +39,6 @@ def export_cameras():
             ]
             
             # We use the object name as the key. 
-            # The User mentioned folders like "Camera0", "Camera1".
-            # Hopefully the Blender objects are named "Camera0", "Camera1" etc.
             cameras_data[obj.name] = {
                 "matrix_world": mat_list,
                 "location": [mw[0][3], mw[1][3], mw[2][3]],
