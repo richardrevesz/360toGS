@@ -28,7 +28,7 @@ def load_blender_cameras(json_path: Path) -> Dict[str, np.ndarray]:
         cameras[name] = mat
     return cameras
 
-def blender_to_colmap_matrix(width=None, height=None):
+def blender_to_colmap_matrix():
     """
     Returns the transformation matrix to convert from Blender Camera 
     coordinate system (Right, Up, Back) to COLMAP Camera coordinate system (Right, Down, Forward).
@@ -48,74 +48,40 @@ def compute_rig_config(
     Creates a RigConfig for the given folder based on Blender poses.
     """
     if ref_camera_name not in blender_cameras:
-        # Fallback to first available if default ref not found
         if not blender_cameras:
             return None
         ref_camera_name = list(blender_cameras.keys())[0]
         
     logging.info(f"Creating RigConfig for {folder_path.name} using ref {ref_camera_name}")
     
-    # 1. Get Reference Camera World Matrix in COLMAP coords
-    # M_ref_world = M_ref_blender * B2C
-    # Wait, M_blender is Local -> World.
-    # P_world = M_blender * P_local_blender
-    # We want P_local_colmap.
-    # P_local_colmap = B2C * P_local_blender => P_local_blender = inv(B2C) * P_local_colmap
-    # P_world_colmap = M_blender * inv(B2C) * P_local_colmap
-    # But P_world_colmap is same as P_world (World coords are same).
-    # So M_colmap = M_blender * inv(B2C).
-    # Since B2C is diag(1, -1, -1), inv(B2C) = B2C.
-    
     B2C = blender_to_colmap_matrix()
     
     M_ref_w = blender_cameras[ref_camera_name] @ B2C
-    M_ref_w_inv = np.linalg.inv(M_ref_w)
     
     rig_cameras = []
     
-    # Check which cameras actually exist in the folder (as subfolders)
-    # The usage assumes image structure: colmap/rig/CameraName/frame#.png
-    # But we need to match the blender name.
-    
-    sorted_cam_names = sorted(blender_cameras.keys())
+    # Reference sensor MUST be added first — pycolmap enforces this.
+    # Sort so ref comes first, then the rest alphabetically.
+    sorted_cam_names = sorted(
+        blender_cameras.keys(),
+        key=lambda n: (n != ref_camera_name, n)
+    )
     
     for cam_name in sorted_cam_names:
-        # Construct prefix. 
-        # COLMAP ImageReader with PER_FOLDER mode will use the relative path 
-        # from the root image_path. 
-        # The root image_path passed to extract_features will likely be the parent containing table2_low etc.
-        # So the image name in DB will be "table2_low/Camera0/frame.png".
-        # The prefix should match this.
-        
         prefix = f"{folder_path.name}/{cam_name}/"
         
-        # Calculate cam_from_rig
-        # Rig is defined as the Reference Camera Frame.
         if cam_name == ref_camera_name:
-            cam_from_rig = None # Identity
+            cam_from_rig = None  # Identity — this is the rig origin
         else:
-            # T_cam_from_ref = T_cam_from_world * T_world_from_ref
-            # T_cam_from_ref = inv(M_cam_w) * M_ref_w
-            
             M_cam_w = blender_cameras[cam_name] @ B2C
-            M_cam_w_inv = np.linalg.inv(M_cam_w)
+            T_c_r = np.linalg.inv(M_cam_w) @ M_ref_w
             
-            # The definition of cam_from_rig in pycolmap is "Transform FROM rig frame TO camera frame".
-            # If Rig Frame = Ref Frame.
-            # We need T_c_r = inv(M_c) * M_r.
-            # Using 4x4 matrices.
-            
-            T_c_r = M_cam_w_inv @ M_ref_w
-            
-            # Extract Rotation and Translation
             R = T_c_r[:3, :3]
             t = T_c_r[:3, 3]
             
             cam_from_rig = pycolmap.Rigid3d(pycolmap.Rotation3d(R), t)
             
-            # Debug: Print rig geometry to verify correctness
             distance = np.linalg.norm(t)
-            # Clamp to avoid numerical issues when trace is slightly outside [-1, 1]
             cos_angle = np.clip((np.trace(R) - 1) / 2, -1.0, 1.0)
             angle_deg = np.rad2deg(np.arccos(cos_angle))
             logging.info(f"  {cam_name} → {ref_camera_name}: distance={distance:.3f}m, rotation={angle_deg:.1f}°")
@@ -131,14 +97,9 @@ def compute_rig_config(
     return pycolmap.RigConfig(cameras=rig_cameras)
 
 def run(args):
-    output_path = args.output_path
-    image_dir = output_path / "images" # COLMAP needs images in one place? No, can extract from source.
-    # Actually, we can just point COLMAP to the source folder if we don't need to copy.
-    # But usually it's safer to not modify source.
-    # However, copying is slow.
-    # Let's use the input path directly as image_path.
-    
     input_path = args.input_path
+    output_path = args.output_path
+    matching = args.matching
     
     database_path = output_path / "database.db"
     output_path.mkdir(exist_ok=True, parents=True)
@@ -148,7 +109,6 @@ def run(args):
         
     rig_configs = []
     
-    # Scan for subdirectories
     subdirs = [p for p in input_path.iterdir() if p.is_dir()]
     logging.info(f"Found {len(subdirs)} subdirectories in {input_path}")
     
@@ -166,41 +126,94 @@ def run(args):
     if not rig_configs:
         logging.warning("No valid rig configurations found.")
         
-    # Extract features
-    # usage: extract_features(database, image_path, ...)
-    # detailed: pycolmap.extract_features(database_path, image_path)
-    
     logging.info("Extracting features...")
     pycolmap.set_random_seed(0)
     
-    # We assume standard feature extraction is sufficient.
+    ### This was here for triangle-splatting2
+    #reader_options = pycolmap.ImageReaderOptions()
+    #reader_options.camera_model = "PINHOLE"
+
     pycolmap.extract_features(
         database_path, 
         input_path, 
         camera_mode=pycolmap.CameraMode.PER_FOLDER
+        #reader_options=reader_options
     )
     
-    # Apply Rig Configs
     if rig_configs:
         logging.info(f"Applying {len(rig_configs)} rig configurations...")
         with pycolmap.Database.open(database_path) as db:
             pycolmap.apply_rig_config(rig_configs, db)
-    
-    # Matching
-    logging.info("Matching features (VocabTree)...")
-    # Configure matching to leverage rig geometry for speed
-    matching_options = pycolmap.FeatureMatchingOptions()
-    matching_options.rig_verification = True  # Use rig constraints for verification
-    matching_options.skip_image_pairs_in_same_frame = True  # Skip within-rig matching
-    pycolmap.match_vocabtree(database_path, matching_options=matching_options)
-    
-    # Reconstruction
+
+
+    # Shared across all strategies
+    def base_matching_options(use_gpu=False):
+        opts = pycolmap.FeatureMatchingOptions()
+        opts.rig_verification = True
+        opts.skip_image_pairs_in_same_frame = True
+        opts.use_gpu = use_gpu
+        opts.guided_matching = True          # uses known rig geometry to guide SIFT — big help for interiors
+        opts.sift.max_ratio = 0.75           # tighter than default 0.8 — reduces false matches on repetitive textures
+        opts.sift.cross_check = True         # already default, but explicit is good
+        return opts
+
+
+    def base_verification_options():
+        opts = pycolmap.TwoViewGeometryOptions()
+        opts.min_num_inliers = 20            # default 15 is too loose for featureless interiors
+        opts.min_E_F_inlier_ratio = 0.95     # already default, keep it
+        opts.ransac.max_error = 3.0          # tighter reprojection — default 4.0 lets sloppy pairs through
+        opts.ransac.min_inlier_ratio = 0.3   # slightly above default 0.25
+        return opts
+
+
+    if matching == "vocabtree":
+        logging.info("Matching features (VocabTree)...")
+
+        pairing = pycolmap.VocabTreePairingOptions()
+        pairing.num_images = 20              # candidates per query; 100 default is wasteful and noisy for interiors
+        pairing.num_nearest_neighbors = 5    # top-5 retrieved images to verify; default is fine
+        pairing.num_checks = 64              # FAISS probe depth; increase to 128 if recall is poor
+        pairing.num_images_after_verification = 10  # keep top-10 after geometric verification
+
+        pycolmap.match_vocabtree(
+            database_path,
+            matching_options=base_matching_options(),
+            pairing_options=pairing,
+            verification_options=base_verification_options(),
+        )
+
+    elif matching == "sequential":
+        logging.info("Matching features (Sequential)...")
+
+        pairing = pycolmap.SequentialPairingOptions()
+        pairing.overlap = 7                  # match each rig to 7 temporal neighbors; tune to your fps/speed
+        pairing.quadratic_overlap = True     # also matches at 1,4,9,16... frames back — better for varying speed
+        pairing.expand_rig_images = True     # already default True — ensures all rig perspectives get matched
+        pairing.loop_detection = True        # enables built-in loop closure via vocab tree
+        pairing.loop_detection_period = 15   # check for loops every 1 frames
+        pairing.loop_detection_num_images = 8   # retrieve top-8 candidates; keep low for repetitive interiors
+        pairing.loop_detection_num_nearest_neighbors = 1
+        pairing.loop_detection_num_images_after_verification = 5
+
+        pycolmap.match_sequential(
+            database_path,
+            matching_options=base_matching_options(),
+            pairing_options=pairing,
+            verification_options=base_verification_options(),
+        )
+
+    elif matching == "exhaustive":
+        logging.info("Matching features (Exhaustive)...")
+        pycolmap.match_exhaustive(
+            database_path,
+            matching_options=base_matching_options(use_gpu=True),
+            verification_options=base_verification_options(),
+        )
     rec_path = output_path / "sparse"
     rec_path.mkdir(exist_ok=True, parents=True)
     
     logging.info("Starting incremental mapping...")
-    
-    # Default RigConfig assumes fixed relative poses but allows rig to move.
     
     maps = pycolmap.incremental_mapping(
         database_path, 
@@ -215,9 +228,10 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_path", type=Path, required=True, help="Parent folder containing table2_low, etc.")
-    parser.add_argument("--output_path", type=Path, required=True, help="Output folder")
+    parser.add_argument("--input_path", type=Path, required=True, help="Parent folder containing subdirs with cameras.json")
+    parser.add_argument("--output_path", type=Path, required=True, help="Output folder for database and sparse reconstruction")
+    parser.add_argument("--matching", type=str, default="vocabtree", required=False, help="Matching method (vocabtree (default), sequential or exhaustive)")
     args = parser.parse_args()
     
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="[COLMAP] %(message)s")
     run(args)
